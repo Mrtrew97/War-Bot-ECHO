@@ -1,54 +1,8 @@
 require('dotenv').config();
-const { Client, GatewayIntentBits, Events, Collection } = require('discord.js');
-const fs = require('fs');
-const path = require('path');
-
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-client.commands = new Collection();
-
-const commandsPath = path.join(__dirname, 'commands');
-const commandFiles = fs.readdirSync(commandsPath).filter(file => file.endsWith('.js'));
-
-for (const file of commandFiles) {
-  const command = require(path.join(commandsPath, file));
-  client.commands.set(command.data.name, command);
-}
-
-client.once(Events.ClientReady, () => {
-  console.log(`Logged in as ${client.user.tag}`);
-});
-
-client.on(Events.InteractionCreate, async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-
-  console.log(`Received command: ${interaction.commandName} from user ${interaction.user.tag}`);
-
-  const command = client.commands.get(interaction.commandName);
-
-  if (!command) {
-    console.warn(`No command matching ${interaction.commandName} found.`);
-    return interaction.reply({ content: 'Command not found!', ephemeral: true });
-  }
-
-  try {
-    await command.execute(interaction);
-    console.log(`Successfully executed command: ${interaction.commandName}`);
-  } catch (error) {
-    console.error(`Error executing command ${interaction.commandName}:`, error);
-    if (!interaction.replied && !interaction.deferred) {
-      await interaction.reply({ content: 'There was an error executing that command.', ephemeral: true });
-    }
-  }
-});
-
-client.login(process.env.DISCORD_TOKEN);
-
-// --- Add this Express web server to keep bot alive ---
-
 const express = require('express');
-const app = express();
+const { Client, GatewayIntentBits, ChannelType, Partials, Events } = require('discord.js');
 
+const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
@@ -56,5 +10,95 @@ app.get('/', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`Web server running on port ${PORT}`);
+  console.log(`🌐 Web server running on port ${PORT}`);
 });
+
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.GuildMessageReactions,
+    GatewayIntentBits.GuildMembers,
+    GatewayIntentBits.MessageContent
+  ],
+  partials: [Partials.Message, Partials.Channel, Partials.Reaction]
+});
+
+const EMOJI_TO_NAME = {
+  '🔴': '🔴 Emergency',
+  '🔵': '🔵 No war Merit Trading Allowed',
+  '🟢': '🟢 Peaceful Zone',
+  '🟡': '🟡 Caution Zone',
+};
+
+let warMessageId = null;
+
+client.once('ready', async () => {
+  console.log(`🤖 Logged in as ${client.user.tag}`);
+
+  const guild = await client.guilds.fetch(process.env.GUILD_ID);
+  const botCommands = guild.channels.cache.get(process.env.BOT_COMMANDS_CHANNEL_ID);
+  const warChannel = guild.channels.cache.get(process.env.WAR_TIME_CHANNEL_ID);
+
+  if (!botCommands || !warChannel) {
+    console.error('❌ Required channels not found by ID.');
+    return;
+  }
+
+  const warMessage = await botCommands.send({
+    content: `🛡️ **Alliance War Status**\n\n🔵 = no fights, merit trading is allowed\n🟢 = active war, no emergency\n🟡 = very active fighting, try to be online\n🔴 = emergency, everyone online!!`,
+  });
+
+  warMessageId = warMessage.id;
+
+  for (const emoji of ['🔵', '🟢', '🟡', '🔴']) {
+    await warMessage.react(emoji);
+  }
+
+  console.log('✅ War status message sent.');
+});
+
+client.on(Events.MessageReactionAdd, async (reaction, user) => {
+  if (user.bot) return;
+
+  try {
+    if (reaction.partial) await reaction.fetch();
+    if (reaction.message.partial) await reaction.message.fetch();
+
+    if (reaction.message.id !== warMessageId) return;
+
+    const emoji = reaction.emoji.name;
+    const newName = EMOJI_TO_NAME[emoji];
+    if (!newName) return;
+
+    const guild = reaction.message.guild;
+    const warChannel = guild.channels.cache.get(process.env.WAR_TIME_CHANNEL_ID);
+    if (!warChannel) {
+      console.error('❌ war-time channel not found by ID.');
+      await reaction.users.remove(user.id); // still reset emoji
+      return;
+    }
+
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('⏰ Rename timed out after 15 seconds.')), 15000)
+    );
+
+    await Promise.race([
+      warChannel.setName(newName),
+      timeoutPromise
+    ]);
+
+    console.log(`✏️ Renamed war-time to ${newName}`);
+  } catch (err) {
+    console.error('❌ Reaction handling failed or timed out:', err.message || err);
+  } finally {
+    // Always reset the user's reaction (even on error/timeout)
+    try {
+      await reaction.users.remove(user.id);
+    } catch (e) {
+      console.error('⚠️ Failed to remove reaction:', e.message || e);
+    }
+  }
+});
+
+client.login(process.env.DISCORD_TOKEN);
